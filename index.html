@@ -800,10 +800,34 @@ document.getElementById('cancelSearch').addEventListener('click',closeSearch);
 document.getElementById('searchMo').addEventListener('click',function(e){if(e.target===e.currentTarget)closeSearch()});
 document.getElementById('searchInput').addEventListener('input',function(){doSearch(this.value)});
 
-// Notification button — long press opens note for first routine
+// Notification button — show status or enable reminders
 document.getElementById('notifBtn').addEventListener('click',function(){
-  if(st.routines.length)openNote(getActiveRoutines(selDate)[0]?.id||st.routines[0].id);
-  else toast('Add routines first');
+  if(!st.reminder){
+    st.reminder=true;saveSt();
+    if('Notification' in window){
+      Notification.requestPermission().then(function(p){
+        if(p==='granted'){
+          toast('Reminders enabled 🔔 — set times on your routines!');
+          playAlarmSound();
+          checkScheduledNotifications();
+          renderProfile();
+        } else {
+          st.reminder=false;saveSt();renderProfile();
+          toast('Notifications blocked — allow in browser settings');
+        }
+      });
+    }
+  } else {
+    // Show upcoming reminders
+    var active=getActiveRoutines(selDate);
+    var upcoming=active.filter(function(r){return r.time && !isComp(r.id)});
+    if(upcoming.length){
+      var names=upcoming.map(function(r){return r.emoji+' '+r.time}).join(', ');
+      toast('Upcoming: '+names);
+    } else {
+      toast('No pending reminders today');
+    }
+  }
 });
 
 // Nav
@@ -831,8 +855,25 @@ document.getElementById('sReset').addEventListener('click',function(){
 document.getElementById('sDark').addEventListener('click',function(){st.darkMode=!st.darkMode;saveSt();applyDark();renderProfile()});
 document.getElementById('sRemind').addEventListener('click',function(){
   st.reminder=!st.reminder;saveSt();renderProfile();
-  if(st.reminder&&'Notification' in window){Notification.requestPermission().then(function(p){if(p==='granted')toast('Reminders enabled 🔔');else{st.reminder=false;saveSt();renderProfile();toast('Notifications blocked')}})}
-  else if(!st.reminder)toast('Reminders disabled');
+  if(st.reminder){
+    if('Notification' in window){
+      Notification.requestPermission().then(function(p){
+        if(p==='granted'){
+          toast('Reminders enabled 🔔 — set times on your routines!');
+          checkScheduledNotifications();
+          playAlarmSound(); // test sound so user hears it
+        } else {
+          st.reminder=false;saveSt();renderProfile();
+          toast('Notifications blocked — please allow in browser settings');
+        }
+      });
+    } else {
+      toast('Notifications not supported in this browser');
+      st.reminder=false;saveSt();renderProfile();
+    }
+  } else {
+    toast('Reminders disabled');
+  }
 });
 
 // Swipe
@@ -852,6 +893,127 @@ document.getElementById('rlist').addEventListener('touchmove',function(){clearTi
 // INIT
 applyDark();render();checkBadges();
 if('serviceWorker' in navigator)navigator.serviceWorker.register('./sw.js');
+
+// ============ NOTIFICATION & ALARM SYSTEM ============
+var notifiedToday = {};  // track which routines have been notified today to avoid repeats
+var audioCtx = null;
+
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+function playAlarmSound() {
+  try {
+    var ctx = getAudioCtx();
+    if (ctx.state === 'suspended') ctx.resume();
+    // Play a repeating ring pattern: 3 beeps
+    var times = [0, 0.4, 0.8];
+    times.forEach(function(startTime) {
+      var osc = ctx.createOscillator();
+      var gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(880, ctx.currentTime + startTime);
+      osc.frequency.setValueAtTime(1100, ctx.currentTime + startTime + 0.1);
+      osc.frequency.setValueAtTime(880, ctx.currentTime + startTime + 0.2);
+      gain.gain.setValueAtTime(0.3, ctx.currentTime + startTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + startTime + 0.3);
+      osc.start(ctx.currentTime + startTime);
+      osc.stop(ctx.currentTime + startTime + 0.3);
+    });
+  } catch (e) { /* audio not available */ }
+}
+
+function showRoutineNotification(routine) {
+  var title = '⏰ ' + routine.emoji + ' ' + routine.name;
+  var body = 'Time for: ' + routine.name + ' (scheduled at ' + routine.time + ')';
+  var tag = 'routine-' + routine.id + '-' + todayStr();
+
+  // Play alarm sound
+  playAlarmSound();
+
+  // Try service worker notification first (works in background)
+  if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+    navigator.serviceWorker.controller.postMessage({
+      type: 'SHOW_NOTIFICATION',
+      title: title,
+      body: body,
+      tag: tag
+    });
+  } else if ('Notification' in window && Notification.permission === 'granted') {
+    // Fallback to regular notification
+    var n = new Notification(title, {
+      body: body,
+      icon: './icons/icon-192.svg',
+      tag: tag,
+      requireInteraction: true,
+      vibrate: [200, 100, 200, 100, 200]
+    });
+    n.onclick = function() { window.focus(); n.close(); };
+  }
+
+  toast('⏰ ' + routine.emoji + ' ' + routine.name);
+}
+
+function checkScheduledNotifications() {
+  if (!st.reminder) return;
+  var today = todayStr();
+  // Reset notified tracker when day changes
+  if (notifiedToday._date !== today) {
+    notifiedToday = { _date: today };
+  }
+  var now = new Date();
+  var currentHH = String(now.getHours()).padStart(2, '0');
+  var currentMM = String(now.getMinutes()).padStart(2, '0');
+  var currentTime = currentHH + ':' + currentMM;
+
+  var active = getActiveRoutines(today);
+  active.forEach(function(r) {
+    if (!r.time) return;  // no scheduled time
+    if (isComp(r.id)) return;  // already completed
+    if (notifiedToday[r.id]) return;  // already notified
+
+    // Check if current time matches routine time (within 1-minute window)
+    if (r.time === currentTime) {
+      notifiedToday[r.id] = true;
+      showRoutineNotification(r);
+    }
+  });
+}
+
+// Check every 15 seconds for scheduled notifications
+var notifInterval = setInterval(checkScheduledNotifications, 15000);
+// Run immediately once
+checkScheduledNotifications();
+
+// Handle "Mark Done" from notification click via service worker
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', function(event) {
+    if (event.data && event.data.type === 'NOTIFICATION_CLICKED') {
+      if (event.data.action === 'done' && event.data.tag) {
+        var rid = event.data.tag.replace('routine-', '').replace('-' + todayStr(), '');
+        if (!isComp(rid)) { toggleComp(rid); }
+      }
+      window.focus();
+    }
+  });
+}
+
+// Auto-request notification permission if reminders are enabled
+if (st.reminder && 'Notification' in window && Notification.permission === 'default') {
+  Notification.requestPermission();
+}
+
+// Ensure audio context unlocks on first user interaction (mobile requirement)
+document.addEventListener('click', function unlockAudio() {
+  try {
+    var ctx = getAudioCtx();
+    if (ctx.state === 'suspended') ctx.resume();
+  } catch(e) {}
+  document.removeEventListener('click', unlockAudio);
+}, { once: true });
 </script>
 </body>
 </html>
