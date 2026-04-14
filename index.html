@@ -345,6 +345,10 @@ body.dark .note-area{background:rgba(255,255,255,.04)}
     <div class="sgrp">
       <div class="srow" id="sDark"><span>Dark Mode</span><div class="tgl" id="darkTgl"></div></div>
       <div class="srow" id="sRemind"><span>Daily Reminder</span><div class="tgl" id="remindTgl"></div></div>
+      <div class="srow" id="sRingtone" style="flex-direction:column;align-items:stretch;cursor:default">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px"><span>Alarm Ringtone</span></div>
+        <div id="ringtoneGrid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px"></div>
+      </div>
     </div>
     <div class="sgrp">
       <div class="srow" id="sExport"><span>Export Data</span><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></div>
@@ -451,9 +455,19 @@ function shiftD(d,n){var x=new Date(d+'T00:00:00');x.setDate(x.getDate()+n);retu
 function genId(){return Date.now().toString(36)+Math.random().toString(36).slice(2,7)}
 function escH(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML}
 
+// ============ RINGTONE DEFINITIONS ============
+var RINGTONES = [
+  {id:'classic',  name:'Classic',    icon:'🔔', notes:[880,1100,880],      tempo:0.75, wave:'sine'},
+  {id:'urgent',   name:'Urgent',     icon:'🚨', notes:[1200,800,1200],     tempo:0.5,  wave:'square'},
+  {id:'gentle',   name:'Gentle',     icon:'🎵', notes:[523,659,784],       tempo:1.0,  wave:'sine'},
+  {id:'digital',  name:'Digital',    icon:'📱', notes:[1400,1000,1400,1000],tempo:0.4,  wave:'triangle'},
+  {id:'chime',    name:'Chime',      icon:'🎶', notes:[784,988,1175,988],  tempo:0.65, wave:'sine'},
+  {id:'buzzer',   name:'Buzzer',     icon:'⏰', notes:[440,440],           tempo:0.6,  wave:'sawtooth'},
+];
+
 function loadSt(){
-  try{var r=localStorage.getItem(SK);if(r){var p=JSON.parse(r);if(p.routines){p.routines.forEach(function(r,i){if(!r.emoji)r.emoji=EMOJIS[i%EMOJIS.length];if(r.colorIndex===undefined)r.colorIndex=i%10;if(!r.repeat)r.repeat='daily';if(!r.id)r.id=genId()});};if(!p.notes)p.notes={};if(!p.unlockedBadges)p.unlockedBadges=[];if(p.darkMode===undefined)p.darkMode=false;if(p.reminder===undefined)p.reminder=false;return p}}catch(e){}
-  return{routines:[],completions:{},notes:{},unlockedBadges:[],darkMode:false,reminder:false};
+  try{var r=localStorage.getItem(SK);if(r){var p=JSON.parse(r);if(p.routines){p.routines.forEach(function(r,i){if(!r.emoji)r.emoji=EMOJIS[i%EMOJIS.length];if(r.colorIndex===undefined)r.colorIndex=i%10;if(!r.repeat)r.repeat='daily';if(!r.id)r.id=genId()});};if(!p.notes)p.notes={};if(!p.unlockedBadges)p.unlockedBadges=[];if(p.darkMode===undefined)p.darkMode=false;if(p.reminder===undefined)p.reminder=false;if(!p.ringtone)p.ringtone='classic';return p}}catch(e){}
+  return{routines:[],completions:{},notes:{},unlockedBadges:[],darkMode:false,reminder:false,ringtone:'classic'};
 }
 function saveSt(){localStorage.setItem(SK,JSON.stringify(st))}
 
@@ -663,6 +677,7 @@ function renderProfile(){
   // Dark mode toggle
   document.getElementById('darkTgl').className='tgl'+(st.darkMode?' on':'');
   document.getElementById('remindTgl').className='tgl'+(st.reminder?' on':'');
+  renderRingtoneGrid();
 }
 
 // ============ NAV ============
@@ -808,7 +823,7 @@ document.getElementById('notifBtn').addEventListener('click',function(){
       Notification.requestPermission().then(function(p){
         if(p==='granted'){
           toast('Reminders enabled 🔔 — set times on your routines!');
-          playAlarmSound();
+          testBeep();
           checkScheduledNotifications();
           renderProfile();
         } else {
@@ -861,7 +876,7 @@ document.getElementById('sRemind').addEventListener('click',function(){
         if(p==='granted'){
           toast('Reminders enabled 🔔 — set times on your routines!');
           checkScheduledNotifications();
-          playAlarmSound(); // test sound so user hears it
+          testBeep(); // test sound so user hears it
         } else {
           st.reminder=false;saveSt();renderProfile();
           toast('Notifications blocked — please allow in browser settings');
@@ -897,44 +912,191 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('./sw.js');
 // ============ NOTIFICATION & ALARM SYSTEM ============
 var notifiedToday = {};  // track which routines have been notified today to avoid repeats
 var audioCtx = null;
+var alarmIntervals = {};  // active alarm loops per routine id
+var snoozeTimers = {};    // snooze timers per routine id
+var alarmOscillators = []; // track active oscillators to stop them
 
 function getAudioCtx() {
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   return audioCtx;
 }
 
-function playAlarmSound() {
+// Short test beep — plays a preview of the selected ringtone
+function testBeep() {
+  playRingtonePreview(st.ringtone || 'classic');
+}
+
+function getSelectedRingtone() {
+  var rt = RINGTONES.find(function(r){ return r.id === st.ringtone; });
+  return rt || RINGTONES[0];
+}
+
+// Play a single cycle of the selected ringtone (for preview)
+function playRingtonePreview(ringtoneId) {
+  var rt = RINGTONES.find(function(r){ return r.id === ringtoneId; }) || RINGTONES[0];
   try {
     var ctx = getAudioCtx();
     if (ctx.state === 'suspended') ctx.resume();
-    // Play a repeating ring pattern: 3 beeps
-    var times = [0, 0.4, 0.8];
-    times.forEach(function(startTime) {
+    var stepDur = 0.15;
+    rt.notes.forEach(function(freq, i) {
       var osc = ctx.createOscillator();
       var gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(880, ctx.currentTime + startTime);
-      osc.frequency.setValueAtTime(1100, ctx.currentTime + startTime + 0.1);
-      osc.frequency.setValueAtTime(880, ctx.currentTime + startTime + 0.2);
-      gain.gain.setValueAtTime(0.3, ctx.currentTime + startTime);
-      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + startTime + 0.3);
-      osc.start(ctx.currentTime + startTime);
-      osc.stop(ctx.currentTime + startTime + 0.3);
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.type = rt.wave;
+      osc.frequency.setValueAtTime(freq, ctx.currentTime + i * stepDur);
+      gain.gain.setValueAtTime(0.3, ctx.currentTime + i * stepDur);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + i * stepDur + stepDur - 0.02);
+      osc.start(ctx.currentTime + i * stepDur);
+      osc.stop(ctx.currentTime + i * stepDur + stepDur);
     });
-  } catch (e) { /* audio not available */ }
+  } catch(e){}
 }
 
-function showRoutineNotification(routine) {
+function renderRingtoneGrid() {
+  var grid = document.getElementById('ringtoneGrid');
+  if (!grid) return;
+  grid.innerHTML = RINGTONES.map(function(rt) {
+    var sel = st.ringtone === rt.id;
+    return '<div onclick="selectRingtone(\''+rt.id+'\')" style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:10px 6px;border-radius:12px;cursor:pointer;transition:all .2s;' +
+      (sel ? 'background:rgba(74,58,255,.15);box-shadow:inset 0 0 0 2px var(--accent)' : 'background:rgba(0,0,0,.04)') + '">' +
+      '<span style="font-size:1.4rem">' + rt.icon + '</span>' +
+      '<span style="font-size:.7rem;font-weight:700;color:' + (sel ? 'var(--accent)' : 'var(--text2)') + '">' + rt.name + '</span>' +
+      '</div>';
+  }).join('');
+}
+
+function selectRingtone(id) {
+  st.ringtone = id;
+  saveSt();
+  renderRingtoneGrid();
+  playRingtonePreview(id);
+}
+
+// Play continuous alarm beeps for 30 seconds using selected ringtone
+function startContinuousAlarm(routineId) {
+  try {
+    var ctx = getAudioCtx();
+    if (ctx.state === 'suspended') ctx.resume();
+    var rt = getSelectedRingtone();
+
+    var beepCount = 0;
+    var maxBeeps = Math.round(30 / rt.tempo); // ~30 seconds
+
+    function playBeep() {
+      try {
+        var stepDur = rt.tempo / rt.notes.length;
+        rt.notes.forEach(function(freq, i) {
+          var osc = ctx.createOscillator();
+          var gain = ctx.createGain();
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.type = rt.wave;
+          var offset = ctx.currentTime + i * stepDur;
+          osc.frequency.setValueAtTime(freq, offset);
+          gain.gain.setValueAtTime(0.35, offset);
+          gain.gain.setValueAtTime(0.35, offset + stepDur * 0.6);
+          gain.gain.exponentialRampToValueAtTime(0.01, offset + stepDur - 0.02);
+          osc.start(offset);
+          osc.stop(offset + stepDur);
+        });
+      } catch(e) {}
+      beepCount++;
+    }
+
+    // Play first beep immediately
+    playBeep();
+    // Then beep every tempo interval for ~30 seconds
+    var iv = setInterval(function() {
+      if (beepCount >= maxBeeps) {
+        clearInterval(iv);
+        delete alarmIntervals[routineId];
+        // 30 seconds elapsed without dismiss — snooze for 5 minutes then ring again
+        scheduleSnooze(routineId);
+        return;
+      }
+      playBeep();
+    }, rt.tempo * 1000);
+
+    alarmIntervals[routineId] = iv;
+  } catch(e) { /* audio not available */ }
+}
+
+function stopAlarm(routineId) {
+  if (alarmIntervals[routineId]) {
+    clearInterval(alarmIntervals[routineId]);
+    delete alarmIntervals[routineId];
+  }
+  if (snoozeTimers[routineId]) {
+    clearTimeout(snoozeTimers[routineId]);
+    delete snoozeTimers[routineId];
+  }
+}
+
+function stopAllAlarms() {
+  for (var rid in alarmIntervals) { clearInterval(alarmIntervals[rid]); }
+  alarmIntervals = {};
+  for (var rid2 in snoozeTimers) { clearTimeout(snoozeTimers[rid2]); }
+  snoozeTimers = {};
+}
+
+function scheduleSnooze(routineId) {
+  // After 5 minutes, ring again if still not completed
+  snoozeTimers[routineId] = setTimeout(function() {
+    delete snoozeTimers[routineId];
+    var r = st.routines.find(function(x) { return x.id === routineId; });
+    if (!r || isComp(routineId)) return; // done or deleted, stop
+    showRoutineAlarm(r);
+  }, 5 * 60 * 1000); // 5 minutes
+}
+
+// ---- ALARM DISMISS OVERLAY ----
+function showAlarmOverlay(routine) {
+  var existing = document.getElementById('alarmOverlay');
+  if (existing) existing.remove();
+
+  var ov = document.createElement('div');
+  ov.id = 'alarmOverlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);z-index:500;display:flex;align-items:center;justify-content:center;padding:20px;animation:cpop .3s ease';
+  var box = document.createElement('div');
+  box.style.cssText = 'background:#fff;border-radius:24px;padding:32px 28px;max-width:340px;width:100%;text-align:center';
+  if (st.darkMode) box.style.background = '#1e1430';
+
+  box.innerHTML =
+    '<div style="font-size:3rem;margin-bottom:12px;animation:ebounce 1s ease-in-out infinite">' + routine.emoji + '</div>' +
+    '<h3 style="font-size:1.2rem;font-weight:900;margin-bottom:6px;color:var(--text)">⏰ Time for ' + escH(routine.name) + '!</h3>' +
+    '<p style="font-size:.85rem;color:var(--text2);margin-bottom:20px">Scheduled at ' + routine.time + '</p>' +
+    '<button id="alarmDismissBtn" style="width:100%;padding:15px;border-radius:16px;border:none;background:linear-gradient(135deg,#34c759,#30b350);color:#fff;font-family:inherit;font-size:1rem;font-weight:800;cursor:pointer;margin-bottom:10px">✓ Done — Mark Complete</button>' +
+    '<button id="alarmSnoozeBtn" style="width:100%;padding:13px;border-radius:16px;border:none;background:rgba(0,0,0,.06);color:var(--text2);font-family:inherit;font-size:.9rem;font-weight:700;cursor:pointer">Snooze 5 min</button>';
+
+  ov.appendChild(box);
+  document.body.appendChild(ov);
+
+  document.getElementById('alarmDismissBtn').addEventListener('click', function() {
+    stopAlarm(routine.id);
+    if (!isComp(routine.id)) toggleComp(routine.id);
+    ov.remove();
+    toast('✅ ' + routine.emoji + ' ' + routine.name + ' completed!');
+  });
+  document.getElementById('alarmSnoozeBtn').addEventListener('click', function() {
+    stopAlarm(routine.id);
+    scheduleSnooze(routine.id);
+    ov.remove();
+    toast('⏰ Snoozed — will ring again in 5 min');
+  });
+}
+
+function showRoutineAlarm(routine) {
   var title = '⏰ ' + routine.emoji + ' ' + routine.name;
   var body = 'Time for: ' + routine.name + ' (scheduled at ' + routine.time + ')';
   var tag = 'routine-' + routine.id + '-' + todayStr();
 
-  // Play alarm sound
-  playAlarmSound();
+  // Start continuous 30s alarm
+  startContinuousAlarm(routine.id);
 
-  // Try service worker notification first (works in background)
+  // Show in-app alarm overlay
+  showAlarmOverlay(routine);
+
+  // Also show system notification
   if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
     navigator.serviceWorker.controller.postMessage({
       type: 'SHOW_NOTIFICATION',
@@ -943,18 +1105,18 @@ function showRoutineNotification(routine) {
       tag: tag
     });
   } else if ('Notification' in window && Notification.permission === 'granted') {
-    // Fallback to regular notification
     var n = new Notification(title, {
       body: body,
       icon: './icons/icon-192.svg',
       tag: tag,
       requireInteraction: true,
-      vibrate: [200, 100, 200, 100, 200]
+      vibrate: [200, 100, 200, 100, 200, 100, 200]
     });
-    n.onclick = function() { window.focus(); n.close(); };
+    n.onclick = function() {
+      window.focus();
+      n.close();
+    };
   }
-
-  toast('⏰ ' + routine.emoji + ' ' + routine.name);
 }
 
 function checkScheduledNotifications() {
@@ -971,22 +1133,32 @@ function checkScheduledNotifications() {
 
   var active = getActiveRoutines(today);
   active.forEach(function(r) {
-    if (!r.time) return;  // no scheduled time
-    if (isComp(r.id)) return;  // already completed
-    if (notifiedToday[r.id]) return;  // already notified
+    if (!r.time) return;
+    if (isComp(r.id)) return;
+    if (notifiedToday[r.id]) return;
 
-    // Check if current time matches routine time (within 1-minute window)
     if (r.time === currentTime) {
       notifiedToday[r.id] = true;
-      showRoutineNotification(r);
+      showRoutineAlarm(r);
     }
   });
 }
 
 // Check every 15 seconds for scheduled notifications
 var notifInterval = setInterval(checkScheduledNotifications, 15000);
-// Run immediately once
 checkScheduledNotifications();
+
+// Stop alarm when user completes a routine via normal card tap
+var origToggleComp = toggleComp;
+toggleComp = function(rid) {
+  origToggleComp(rid);
+  // If task just got completed, stop its alarm
+  if (isComp(rid)) {
+    stopAlarm(rid);
+    var ov = document.getElementById('alarmOverlay');
+    if (ov) ov.remove();
+  }
+};
 
 // Handle "Mark Done" from notification click via service worker
 if ('serviceWorker' in navigator) {
@@ -995,6 +1167,9 @@ if ('serviceWorker' in navigator) {
       if (event.data.action === 'done' && event.data.tag) {
         var rid = event.data.tag.replace('routine-', '').replace('-' + todayStr(), '');
         if (!isComp(rid)) { toggleComp(rid); }
+        stopAlarm(rid);
+        var ov = document.getElementById('alarmOverlay');
+        if (ov) ov.remove();
       }
       window.focus();
     }
