@@ -1,4 +1,4 @@
-const CACHE_NAME = 'routine-tracker-v3';
+const CACHE_NAME = 'routine-tracker-v5';
 const ASSETS = [
   './',
   './index.html',
@@ -23,17 +23,21 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
+// Network-first strategy: always try to fetch fresh content,
+// fall back to cache only when offline
 self.addEventListener('fetch', (event) => {
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      return cached || fetch(event.request).then((response) => {
-        if (response.ok && event.request.method === 'GET') {
-          const clone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-        }
-        return response;
+    fetch(event.request).then((response) => {
+      if (response.ok && event.request.method === 'GET') {
+        const clone = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+      }
+      return response;
+    }).catch(() => {
+      return caches.match(event.request).then((cached) => {
+        return cached || caches.match('./index.html');
       });
-    }).catch(() => caches.match('./index.html'))
+    })
   );
 });
 
